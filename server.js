@@ -24,7 +24,9 @@ app.use(express.urlencoded({ extended: true }));
 
 const PORT = process.env.PORT || 3001;
 const WEBHOOK_URL = process.env.WEBHOOK_URL || 'http://localhost/webhat-desk/api/webhook.php';
-const UPLOADS_DIR = path.join(__dirname, '..', 'uploads');
+const DESK_URL = WEBHOOK_URL.replace(/\/api\/[^/]+$/, '');
+const BRIDGE_SECRET_TOKEN = process.env.BRIDGE_SECRET_TOKEN || 'webhat_bridge_secure_2024';
+const UPLOADS_DIR = path.join(__dirname, 'uploads');
 const AUTH_DIR = process.env.AUTH_DIR ? path.join(process.env.AUTH_DIR, 'auth_info_baileys') : path.join(__dirname, 'auth_info_baileys');
 const LID_MAP_FILE = process.env.AUTH_DIR ? path.join(process.env.AUTH_DIR, 'lid_map.json') : path.join(__dirname, 'lid_map.json');
 
@@ -44,6 +46,28 @@ function saveLidMap() {
     try {
         fs.writeFileSync(LID_MAP_FILE, JSON.stringify(lidMap, null, 2));
     } catch (e) {}
+}
+
+// Upload incoming WhatsApp media to PHP server for permanent hosting
+async function uploadMediaToDesk(buffer, mediaType, ext) {
+    try {
+        const uploadUrl = `${DESK_URL}/api/bridge_upload.php?type=${mediaType}&ext=${ext}&token=${BRIDGE_SECRET_TOKEN}`;
+        const response = await axios.post(uploadUrl, buffer, {
+            headers: {
+                'Content-Type': 'application/octet-stream',
+                'X-Bridge-Token': BRIDGE_SECRET_TOKEN
+            },
+            timeout: 20000,
+            maxContentLength: 50 * 1024 * 1024
+        });
+        if (response.data && response.data.url) {
+            console.log(`[Baileys] Media uploaded to desk: ${response.data.url}`);
+            return response.data.url;
+        }
+    } catch (err) {
+        console.error('[Baileys] Failed to upload media to desk:', err.message);
+    }
+    return null;
 }
 
 if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR, { recursive: true });
@@ -328,10 +352,7 @@ async function initWhatsApp() {
                     textBody = '🎤 Voice Message';
                     try {
                         const buffer = await downloadMediaMessage(msg, 'buffer', {});
-                        const fileName = 'wa_' + Date.now() + '_' + Math.random().toString(36).substring(7) + '.ogg';
-                        const filePath = path.join(UPLOADS_DIR, fileName);
-                        fs.writeFileSync(filePath, buffer);
-                        mediaUrl = 'uploads/' + fileName;
+                        mediaUrl = await uploadMediaToDesk(buffer, 'audio', 'ogg');
                     } catch (err) {
                         console.error('[Baileys] Error downloading audio:', err.message);
                     }
@@ -340,10 +361,7 @@ async function initWhatsApp() {
                     textBody = content.imageMessage.caption || '📷 Photo';
                     try {
                         const buffer = await downloadMediaMessage(msg, 'buffer', {});
-                        const fileName = 'wa_' + Date.now() + '_' + Math.random().toString(36).substring(7) + '.jpg';
-                        const filePath = path.join(UPLOADS_DIR, fileName);
-                        fs.writeFileSync(filePath, buffer);
-                        mediaUrl = 'uploads/' + fileName;
+                        mediaUrl = await uploadMediaToDesk(buffer, 'image', 'jpg');
                     } catch (err) {
                         console.error('[Baileys] Error downloading image:', err.message);
                     }
@@ -352,10 +370,7 @@ async function initWhatsApp() {
                     textBody = content.videoMessage.caption || '🎥 Video';
                     try {
                         const buffer = await downloadMediaMessage(msg, 'buffer', {});
-                        const fileName = 'wa_' + Date.now() + '_' + Math.random().toString(36).substring(7) + '.mp4';
-                        const filePath = path.join(UPLOADS_DIR, fileName);
-                        fs.writeFileSync(filePath, buffer);
-                        mediaUrl = 'uploads/' + fileName;
+                        mediaUrl = await uploadMediaToDesk(buffer, 'video', 'mp4');
                     } catch (err) {
                         console.error('[Baileys] Error downloading video:', err.message);
                     }
@@ -364,11 +379,8 @@ async function initWhatsApp() {
                     textBody = content.documentMessage.fileName || '📄 Document';
                     try {
                         const buffer = await downloadMediaMessage(msg, 'buffer', {});
-                        const ext = path.extname(content.documentMessage.fileName || '') || '.pdf';
-                        const fileName = 'wa_' + Date.now() + '_' + Math.random().toString(36).substring(7) + ext;
-                        const filePath = path.join(UPLOADS_DIR, fileName);
-                        fs.writeFileSync(filePath, buffer);
-                        mediaUrl = 'uploads/' + fileName;
+                        const docExt = path.extname(content.documentMessage.fileName || '').replace('.', '') || 'pdf';
+                        mediaUrl = await uploadMediaToDesk(buffer, 'document', docExt);
                     } catch (err) {
                         console.error('[Baileys] Error downloading document:', err.message);
                     }
@@ -711,43 +723,66 @@ app.post('/send', async (req, res) => {
         let sentMsg = null;
 
         if (mediaUrl) {
-            // Absolute path to uploaded media
-            const relativePath = mediaUrl.replace(/^\/?uploads\//, '');
-            const localFilePath = path.join(UPLOADS_DIR, relativePath);
+            let fileBuffer = null;
+            let localFilePath = null;
 
-            if (fs.existsSync(localFilePath)) {
-                const fileBuffer = fs.readFileSync(localFilePath);
+            if (mediaUrl.startsWith('http://') || mediaUrl.startsWith('https://')) {
+                // Download from full URL (PHP server on StackCP)
+                try {
+                    console.log(`[Baileys /send] Downloading media from URL: ${mediaUrl}`);
+                    const response = await axios.get(mediaUrl, { responseType: 'arraybuffer', timeout: 20000 });
+                    fileBuffer = Buffer.from(response.data);
+                    console.log(`[Baileys /send] Downloaded ${fileBuffer.length} bytes`);
+                } catch (dlErr) {
+                    console.error('[Baileys /send] Failed to download media:', dlErr.message);
+                }
+            } else {
+                // Legacy: local file path
+                const relativePath = mediaUrl.replace(/^\/?uploads\//, '');
+                localFilePath = path.join(UPLOADS_DIR, relativePath);
+                if (fs.existsSync(localFilePath)) {
+                    fileBuffer = fs.readFileSync(localFilePath);
+                }
+            }
 
+            if (fileBuffer) {
+                // Save temp file for audio processing
+                const tmpPath = path.join(UPLOADS_DIR, `tmp_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`);
                 if (mediaType === 'audio') {
                     let audioToSend = fileBuffer;
-                    let targetAudioPath = localFilePath;
+                    let targetAudioPath = tmpPath + '.audio';
+                    fs.writeFileSync(targetAudioPath, fileBuffer);
 
-                    // Ensure audio is WhatsApp-compliant Opus OGG for both Android and iPhone (iOS)
                     const tempOgg = path.join(UPLOADS_DIR, `ptt_${Date.now()}_${Math.random().toString(36).substr(2, 6)}.ogg`);
                     try {
                         const ffmpegBin = fs.existsSync(FFMPEG_PATH) ? `"${FFMPEG_PATH}"` : 'ffmpeg';
-                        execSync(`${ffmpegBin} -i "${localFilePath}" -c:a libopus -b:a 32k -ar 48000 -ac 1 -vbr on -avoid_negative_ts make_zero -map_metadata -1 -application voip -y "${tempOgg}"`, { stdio: 'pipe' });
+                        execSync(`${ffmpegBin} -i "${targetAudioPath}" -c:a libopus -b:a 32k -ar 48000 -ac 1 -vbr on -avoid_negative_ts make_zero -map_metadata -1 -application voip -y "${tempOgg}"`, { stdio: 'pipe' });
                         if (fs.existsSync(tempOgg) && fs.statSync(tempOgg).size > 0) {
                             audioToSend = fs.readFileSync(tempOgg);
-                            targetAudioPath = tempOgg;
+                            const waveform = extractAudioWaveform(tempOgg);
+                            try { fs.unlinkSync(targetAudioPath); } catch(e) {}
+                            try { fs.unlinkSync(tempOgg); } catch(e) {}
+                            sentMsg = await sock.sendMessage(jid, {
+                                audio: audioToSend,
+                                mimetype: 'audio/ogg; codecs=opus',
+                                ptt: true,
+                                waveform: waveform
+                            });
+                        } else {
+                            throw new Error('ffmpeg output empty');
                         }
                     } catch (convErr) {
                         console.error('Audio conversion error:', convErr.message);
-                    }
-
-                    // Extract authentic speech waveform so WhatsApp renders full visual waveform bars!
-                    const waveform = extractAudioWaveform(targetAudioPath);
-
-                    if (targetAudioPath !== localFilePath) {
                         try { fs.unlinkSync(targetAudioPath); } catch(e) {}
+                        // Fallback: send raw audio
+                        const waveform = extractAudioWaveform(tmpPath + '.audio');
+                        sentMsg = await sock.sendMessage(jid, {
+                            audio: fileBuffer,
+                            mimetype: 'audio/ogg; codecs=opus',
+                            ptt: true,
+                            waveform: waveform
+                        });
                     }
-
-                    sentMsg = await sock.sendMessage(jid, {
-                        audio: audioToSend,
-                        mimetype: 'audio/ogg; codecs=opus',
-                        ptt: true, // send as native WhatsApp Voice Note!
-                        waveform: waveform
-                    });
                 } else if (mediaType === 'image') {
                     sentMsg = await sock.sendMessage(jid, {
                         image: fileBuffer,
@@ -762,12 +797,13 @@ app.post('/send', async (req, res) => {
                     sentMsg = await sock.sendMessage(jid, {
                         document: fileBuffer,
                         mimetype: 'application/octet-stream',
-                        fileName: path.basename(localFilePath)
+                        fileName: path.basename(mediaUrl)
                     });
                 }
             } else {
-                // Fallback to text if file missing
-                sentMsg = await sock.sendMessage(jid, { text: message || '' });
+                // Fallback to text if file missing/download failed
+                console.warn('[Baileys /send] Media unavailable, sending as text');
+                sentMsg = await sock.sendMessage(jid, { text: message || mediaUrl });
             }
         } else if (message) {
             sentMsg = await sock.sendMessage(jid, { text: message });
