@@ -835,4 +835,18 @@ app.listen(PORT, () => {
     console.log(`👉 Open http://localhost:${PORT}/qr to scan QR Code!`);
     console.log(`====================================================`);
     initWhatsApp();
+
+    // WhatsApp WebSocket Keep-Alive Heartbeat (every 30 seconds)
+    // Prevents Baileys WebSocket from going silent → causes 3-4 min incoming message delays
+    setInterval(async () => {
+        if (isConnected && sock) {
+            try {
+                await sock.sendPresenceUpdate('available');
+                await new Promise(r => setTimeout(r, 500));
+                await sock.sendPresenceUpdate('unavailable');
+            } catch(e) {
+                // Connection might be broken, will auto-reconnect via connection.update handler
+            }
+        }
+    }, 30000); // every 30 seconds
 });
