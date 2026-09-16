@@ -25,8 +25,8 @@ app.use(express.urlencoded({ extended: true }));
 const PORT = process.env.PORT || 3001;
 const WEBHOOK_URL = process.env.WEBHOOK_URL || 'http://localhost/webhat-desk/api/webhook.php';
 const UPLOADS_DIR = path.join(__dirname, '..', 'uploads');
-const AUTH_DIR = path.join(__dirname, 'auth_info_baileys');
-const LID_MAP_FILE = path.join(__dirname, 'lid_map.json');
+const AUTH_DIR = process.env.AUTH_DIR ? path.join(process.env.AUTH_DIR, 'auth_info_baileys') : path.join(__dirname, 'auth_info_baileys');
+const LID_MAP_FILE = process.env.AUTH_DIR ? path.join(process.env.AUTH_DIR, 'lid_map.json') : path.join(__dirname, 'lid_map.json');
 
 let lidMap = {
     '69230577860638@lid': '8801764983880'
