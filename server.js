@@ -490,26 +490,41 @@ app.post('/mark-read', async (req, res) => {
     }
     try {
         let clean = phone.replace(/[^0-9]/g, '');
-        if (clean.startsWith('01') && clean.length === 11) clean = '88' + clean;
+        let cleanWith88 = clean.startsWith('01') && clean.length === 11 ? '88' + clean : clean;
+        let cleanWithout88 = cleanWith88.startsWith('8801') ? cleanWith88.substring(2) : cleanWith88;
 
-        const mappedLid = Object.keys(lidMap).find(k => lidMap[k] === clean);
-        const jid = mappedLid || (phone.includes('@') ? phone : `${clean}@s.whatsapp.net`);
+        const mappedLid = Object.keys(lidMap).find(k => lidMap[k] === cleanWith88 || lidMap[k] === cleanWithout88);
+        const jid = mappedLid || (phone.includes('@') ? phone : `${cleanWith88}@s.whatsapp.net`);
 
-        // Collect all unread message keys for this sender
+        // Collect all unread message keys for this sender across all format variants
         const keys = [
             ...(unreadKeysByJid[jid] || []),
             ...(unreadKeysByPhone[clean] || []),
+            ...(unreadKeysByPhone[cleanWith88] || []),
+            ...(unreadKeysByPhone[cleanWithout88] || []),
             ...(mappedLid && unreadKeysByJid[mappedLid] ? unreadKeysByJid[mappedLid] : [])
         ];
 
-        if (keys.length > 0) {
-            await sock.readMessages(keys);
-            console.log(`[Baileys Read] Agent viewed chat! Sent BLUE DOUBLE-TICKS for ${keys.length} msgs from ${clean} (${jid})`);
+        // Deduplicate keys by id
+        const uniqueKeys = [];
+        const seenIds = new Set();
+        for (const k of keys) {
+            if (k && k.id && !seenIds.has(k.id)) {
+                seenIds.add(k.id);
+                uniqueKeys.push(k);
+            }
+        }
+
+        if (uniqueKeys.length > 0) {
+            await sock.readMessages(uniqueKeys);
+            console.log(`[Baileys Read] Agent viewed chat! Sent BLUE DOUBLE-TICKS for ${uniqueKeys.length} msgs from ${cleanWith88} (${jid})`);
         }
 
         // Clear local unread queue
         delete unreadKeysByJid[jid];
         delete unreadKeysByPhone[clean];
+        delete unreadKeysByPhone[cleanWith88];
+        delete unreadKeysByPhone[cleanWithout88];
         if (mappedLid) delete unreadKeysByJid[mappedLid];
 
         try {
