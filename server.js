@@ -269,6 +269,44 @@ async function initWhatsApp() {
     const processedCalls = new Set();
     const ringingCalls = new Map();
 
+    function resolveCallerPhone(call) {
+        const candidates = [call.from, call.chatId, call.sender, call.remoteJid, call.participant].filter(Boolean);
+
+        // 1. Direct phone number check
+        for (const c of candidates) {
+            const clean = c.split(':')[0];
+            if (clean.endsWith('@s.whatsapp.net')) {
+                const pn = clean.replace('@s.whatsapp.net', '');
+                if (pn.length >= 10) {
+                    for (const lidCand of candidates) {
+                        if (lidCand.includes('@lid')) {
+                            lidMap[lidCand.split(':')[0]] = pn;
+                            saveLidMap();
+                        }
+                    }
+                    return pn;
+                }
+            } else if (/^\d{10,15}$/.test(clean)) {
+                return clean;
+            }
+        }
+
+        // 2. Check lidMap for any candidate
+        for (const c of candidates) {
+            const clean = c.split(':')[0];
+            if (lidMap[c]) return lidMap[c];
+            if (lidMap[clean]) return lidMap[clean];
+            const withLid = clean.endsWith('@lid') ? clean : (clean + '@lid');
+            if (lidMap[withLid]) return lidMap[withLid];
+            const withoutLid = clean.replace('@lid', '');
+            if (lidMap[withoutLid]) return lidMap[withoutLid];
+        }
+
+        // 3. Fallback
+        const raw = (candidates[0] || '').split(':')[0];
+        return raw.replace('@s.whatsapp.net', '').replace('@lid', '');
+    }
+
     async function forwardMissedCallToDesk(fromPhone, callId, callType) {
         try {
             const now = new Date();
@@ -281,9 +319,14 @@ async function initWhatsApp() {
             const textBody = `📞 Missed ${callType} Call (${timeStr})`;
             const timestamp = Math.floor(now.getTime() / 1000);
             const msgId = 'call_' + callId;
-            const senderName = 'Customer ' + fromPhone.slice(-4);
+            let senderName = 'Customer';
+            if (fromPhone === '8801764983880') {
+                senderName = 'G. Rabbi';
+            } else {
+                senderName = 'Customer ' + fromPhone.slice(-4);
+            }
 
-            console.log(`[Baileys Bridge] Forwarding missed call to desk: ${fromPhone} -> ${textBody}`);
+            console.log(`[Baileys Bridge] Forwarding missed call to desk: ${fromPhone} (${senderName}) -> ${textBody}`);
 
             const webhookPayload = {
                 object: 'whatsapp_business_account',
@@ -333,7 +376,7 @@ async function initWhatsApp() {
                 const rawCaller = call.from || call.chatId || '';
                 if (!rawCaller || rawCaller.endsWith('@g.us') || rawCaller === 'status@broadcast') continue;
 
-                const fromPhone = rawCaller.replace('@s.whatsapp.net', '').split(':')[0];
+                const fromPhone = resolveCallerPhone(call);
                 if (!fromPhone) continue;
 
                 const callId = call.id || `${fromPhone}_${Date.now()}`;
@@ -341,7 +384,7 @@ async function initWhatsApp() {
                 const callType = isVideo ? 'Video' : 'Voice';
                 const status = call.status; // 'offer' | 'ringing' | 'timeout' | 'reject' | 'accept' | 'terminate'
 
-                console.log(`[Baileys Call] Event from ${fromPhone}, CallId: ${callId}, Status: ${status}, Video: ${isVideo}`);
+                console.log(`[Baileys Call] Event for ${fromPhone} (raw: ${rawCaller}), CallId: ${callId}, Status: ${status}, Video: ${isVideo}`);
 
                 if (status === 'offer' || status === 'ringing') {
                     // Call is currently ringing. Track it.
