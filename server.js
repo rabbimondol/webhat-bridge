@@ -265,6 +265,124 @@ async function initWhatsApp() {
         }
     });
 
+    // --- Missed Call Tracking & Notification ---
+    const processedCalls = new Set();
+    const ringingCalls = new Map();
+
+    async function forwardMissedCallToDesk(fromPhone, callId, callType) {
+        try {
+            const now = new Date();
+            const timeStr = now.toLocaleTimeString('en-US', { 
+                hour: '2-digit', 
+                minute: '2-digit', 
+                hour12: true, 
+                timeZone: 'Asia/Dhaka' 
+            });
+            const textBody = `📞 Missed ${callType} Call (${timeStr})`;
+            const timestamp = Math.floor(now.getTime() / 1000);
+            const msgId = 'call_' + callId;
+            const senderName = 'Customer ' + fromPhone.slice(-4);
+
+            console.log(`[Baileys Bridge] Forwarding missed call to desk: ${fromPhone} -> ${textBody}`);
+
+            const webhookPayload = {
+                object: 'whatsapp_business_account',
+                entry: [{
+                    id: 'baileys_gateway',
+                    changes: [{
+                        field: 'messages',
+                        value: {
+                            messaging_product: 'whatsapp',
+                            metadata: {
+                                display_phone_number: connectedPhone || '',
+                                phone_number_id: 'baileys'
+                            },
+                            contacts: [{
+                                profile: { name: senderName },
+                                wa_id: fromPhone
+                            }],
+                            messages: [{
+                                from: fromPhone,
+                                id: msgId,
+                                timestamp: timestamp,
+                                type: 'text',
+                                text: { body: textBody }
+                            }]
+                        }
+                    }]
+                }]
+            };
+
+            await axios.post(WEBHOOK_URL, webhookPayload, {
+                headers: { 'Content-Type': 'application/json' },
+                timeout: 8000
+            });
+        } catch (err) {
+            console.error('[Baileys Bridge] Failed to forward missed call to desk:', err.message);
+        }
+    }
+
+    // Handle Incoming WhatsApp Calls
+    sock.ev.on('call', async (callEvents) => {
+        if (!Array.isArray(callEvents)) return;
+
+        for (const call of callEvents) {
+            try {
+                if (!call || call.isGroup) continue;
+
+                const rawCaller = call.from || call.chatId || '';
+                if (!rawCaller || rawCaller.endsWith('@g.us') || rawCaller === 'status@broadcast') continue;
+
+                const fromPhone = rawCaller.replace('@s.whatsapp.net', '').split(':')[0];
+                if (!fromPhone) continue;
+
+                const callId = call.id || `${fromPhone}_${Date.now()}`;
+                const isVideo = !!call.isVideo;
+                const callType = isVideo ? 'Video' : 'Voice';
+                const status = call.status; // 'offer' | 'ringing' | 'timeout' | 'reject' | 'accept' | 'terminate'
+
+                console.log(`[Baileys Call] Event from ${fromPhone}, CallId: ${callId}, Status: ${status}, Video: ${isVideo}`);
+
+                if (status === 'offer' || status === 'ringing') {
+                    // Call is currently ringing. Track it.
+                    if (!ringingCalls.has(callId)) {
+                        ringingCalls.set(callId, {
+                            phone: fromPhone,
+                            isVideo: isVideo,
+                            callType: callType,
+                            startTime: Date.now(),
+                            timer: setTimeout(async () => {
+                                // Fallback timeout: If no terminate event after 45s, treat as missed
+                                if (!processedCalls.has(callId)) {
+                                    processedCalls.add(callId);
+                                    ringingCalls.delete(callId);
+                                    await forwardMissedCallToDesk(fromPhone, callId, callType);
+                                }
+                            }, 45000)
+                        });
+                    }
+                } else if (status === 'timeout' || status === 'reject' || status === 'terminate') {
+                    // Call ended / missed / rejected
+                    if (ringingCalls.has(callId)) {
+                        const tracked = ringingCalls.get(callId);
+                        if (tracked && tracked.timer) clearTimeout(tracked.timer);
+                        ringingCalls.delete(callId);
+                    }
+
+                    if (!processedCalls.has(callId)) {
+                        processedCalls.add(callId);
+                        // Clean up processedCalls set after 1 hour to prevent memory leaks
+                        setTimeout(() => processedCalls.delete(callId), 3600000);
+
+                        await forwardMissedCallToDesk(fromPhone, callId, callType);
+                    }
+                }
+            } catch (callErr) {
+                console.error('[Baileys Call Error]', callErr.message);
+            }
+        }
+    });
+
     // Handle Incoming and Phone-outgoing Messages
     sock.ev.on('messages.upsert', async (m) => {
         if (!m.messages || m.messages.length === 0) return;
